@@ -25,3 +25,8 @@ void sdcard_install_retrying_diskio(sdmmc_card_t* card);
 // climbs the controller is being disturbed, and if `failed` climbs the
 // card itself is in trouble.
 void sdcard_retry_stats(uint32_t* retried, uint32_t* failed);
+
+// How many sectors went through the bounce buffer because the buffer
+// FatFs (or an app) gave was in RAM the card's DMA cannot reach (TCM, LP
+// RAM). Nonzero is fine -- that is the bounce doing its job.
+uint32_t sdcard_bounced_sectors(void);

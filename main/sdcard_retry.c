@@ -46,9 +46,13 @@
 
 #include "sdcard.h"
 
+#include <string.h>
+
 #include "diskio_impl.h"
 #include "diskio_sdmmc.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "ff.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -100,52 +104,94 @@ static unsigned waited_ms(int try) {
 // cannot hide behind the retries.
 static uint32_t s_retried;   // operations that needed more than one go
 static uint32_t s_failed;    // ... and the ones that ran out of goes
+static uint32_t s_bounced;   // sectors that went through the bounce buffer (below)
 
-static DRESULT sd_read(BYTE pdrv, BYTE* buff, DWORD sector, UINT count) {
-    (void)pdrv;
+// ---------------------------------------------------------------------
+//  Buffers the card's DMA cannot reach
+// ---------------------------------------------------------------------
+//  FatFs allocates its buffers -- each open file's sector buffer with
+//  CONFIG_FATFS_USE_DYN_BUFFERS, the LFN work area -- with plain
+//  malloc, and an app's own reads and writes of whole sectors go
+//  straight from the app's buffer. On the P4 a small malloc can land in
+//  SPM (TCM, 0x30100000) or, with ALLOW_RTC_FAST_MEM_AS_HEAP, in LP RAM
+//  (0x50108000): both are in the default heap, and the SDMMC DMA can
+//  reach neither. sdmmc_read_sectors / sdmmc_write_sectors only bounce a
+//  buffer that is misaligned; an ALIGNED one in TCM or LP RAM goes to
+//  the DMA as it is, esp_cache_msync() refuses the address, and the
+//  transaction fails -- every time, so no retry helps, and FatFs then
+//  fails every later access to that file. Seen in an app (Portals) as
+//  "close failed, EIO" on every save, with the probe of where FatFs's
+//  buffer would go reading TCM -- and 25 KB of DMA-capable RAM free.
+//  (idf6_sd_fuckup.md 11.1 met the same thing with newlib's stdio buffer
+//  in RTC fast memory.)
+//
+//  So a buffer the DMA cannot reach goes through one sector of DMA-
+//  capable internal RAM, a sector at a time. FatFs serialises access to
+//  the volume, so one bounce buffer is enough. Buffers in L2 or PSRAM
+//  (which the P4's DMA reaches) are untouched: this costs nothing on
+//  the usual path.
+static uint8_t* s_bounce;  // one sector, DMA-capable, cache-line aligned
+
+static bool dma_reaches(void const* p, size_t n) {
+    char const* const a = p;
+    char const* const z = a + n - 1;
+    return (esp_ptr_dma_capable(a) && esp_ptr_dma_capable(z)) || (esp_ptr_dma_ext_capable(a) && esp_ptr_dma_ext_capable(z));
+}
+
+// One transfer, tried as SD_BACKOFF_MS says.
+static DRESULT transfer(bool write, BYTE* buff, DWORD sector, UINT count) {
     esp_err_t err = ESP_OK;
     for (int try = 0; try < SD_TRIES; try++) {
         if (SD_BACKOFF_MS[try] > 0) vTaskDelay(pdMS_TO_TICKS(SD_BACKOFF_MS[try]));
-        err = sdmmc_read_sectors(s_card, buff, sector, count);
+        // A write is idempotent: the same bytes to the same sectors. A
+        // partially written multi-sector run is simply written again
+        // from the start.
+        err = write ? sdmmc_write_sectors(s_card, buff, sector, count) : sdmmc_read_sectors(s_card, buff, sector, count);
         if (err == ESP_OK) {
             if (try > 0) {
                 s_retried++;
                 // Which attempt worked is the diagnosis: attempt 2 is a
                 // glitch, attempt 4 or 5 is a card that needed the time.
-                ESP_LOGW(TAG, "read of sector %" PRIu32 " succeeded on attempt %d (after %u ms of waiting)",
-                         (uint32_t)sector, try + 1, (unsigned)waited_ms(try));
+                ESP_LOGW(TAG, "%s of sector %" PRIu32 " succeeded on attempt %d (after %u ms of waiting)",
+                         write ? "write" : "read", (uint32_t)sector, try + 1, (unsigned)waited_ms(try));
             }
             return RES_OK;
         }
     }
     s_failed++;
-    ESP_LOGE(TAG, "read of %u sector(s) at %" PRIu32 " failed %d times (0x%x)", (unsigned)count, (uint32_t)sector,
-             SD_TRIES, err);
+    ESP_LOGE(TAG, "%s of %u sector(s) at %" PRIu32 " failed %d times (0x%x)%s", write ? "write" : "read",
+             (unsigned)count, (uint32_t)sector, SD_TRIES, err, write ? " -- FatFs will leak the cluster" : "");
     return RES_ERROR;
+}
+
+// A transfer whose buffer the DMA cannot reach: a sector at a time,
+// through s_bounce.
+static DRESULT bounced(bool write, BYTE* buff, DWORD sector, UINT count) {
+    size_t const ss = (size_t)s_card->csd.sector_size;
+    for (UINT i = 0; i < count; i++) {
+        BYTE* const at = buff + (size_t)i * ss;
+        if (write) memcpy(s_bounce, at, ss);
+        DRESULT const r = transfer(write, s_bounce, sector + i, 1);
+        if (r != RES_OK) return r;
+        if (!write) memcpy(at, s_bounce, ss);
+        s_bounced++;
+    }
+    return RES_OK;
+}
+
+static DRESULT sd_read(BYTE pdrv, BYTE* buff, DWORD sector, UINT count) {
+    (void)pdrv;
+    size_t const n = (size_t)count * (size_t)s_card->csd.sector_size;
+    if (s_bounce != NULL && !dma_reaches(buff, n)) return bounced(false, buff, sector, count);
+    return transfer(false, buff, sector, count);
 }
 
 static DRESULT sd_write(BYTE pdrv, BYTE const* buff, DWORD sector, UINT count) {
     (void)pdrv;
-    esp_err_t err = ESP_OK;
-    for (int try = 0; try < SD_TRIES; try++) {
-        if (SD_BACKOFF_MS[try] > 0) vTaskDelay(pdMS_TO_TICKS(SD_BACKOFF_MS[try]));
-        // Idempotent: the same bytes to the same sectors. A partially
-        // written multi-sector run is simply written again from the
-        // start.
-        err = sdmmc_write_sectors(s_card, buff, sector, count);
-        if (err == ESP_OK) {
-            if (try > 0) {
-                s_retried++;
-                ESP_LOGW(TAG, "write of sector %" PRIu32 " succeeded on attempt %d (after %u ms of waiting)",
-                         (uint32_t)sector, try + 1, (unsigned)waited_ms(try));
-            }
-            return RES_OK;
-        }
-    }
-    s_failed++;
-    ESP_LOGE(TAG, "write of %u sector(s) at %" PRIu32 " failed %d times (0x%x) -- FatFs will leak the cluster",
-             (unsigned)count, (uint32_t)sector, SD_TRIES, err);
-    return RES_ERROR;
+    size_t const n = (size_t)count * (size_t)s_card->csd.sector_size;
+    // transfer() and bounced() write from it, never into it.
+    if (s_bounce != NULL && !dma_reaches(buff, n)) return bounced(true, (BYTE*)buff, sector, count);
+    return transfer(true, (BYTE*)buff, sector, count);
 }
 
 static DSTATUS sd_status(BYTE pdrv) {
@@ -177,6 +223,11 @@ void sdcard_install_retrying_diskio(sdmmc_card_t* card) {
     if (card == NULL) return;
     s_card = card;
 
+    // The bounce buffer for what the DMA cannot reach (above). Without
+    // it, such a buffer goes to the card as before.
+    s_bounce = heap_caps_aligned_alloc(64, (size_t)card->csd.sector_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (s_bounce == NULL) ESP_LOGW(TAG, "no bounce buffer: buffers in TCM or LP RAM will fail on the card");
+
     BYTE const pdrv = ff_diskio_get_pdrv_card(card);
     if (pdrv == 0xFF) {
         ESP_LOGE(TAG, "the card has no drive number; leaving ESP-IDF's disk layer in place");
@@ -198,4 +249,8 @@ void sdcard_install_retrying_diskio(sdmmc_card_t* card) {
 void sdcard_retry_stats(uint32_t* retried, uint32_t* failed) {
     if (retried != NULL) *retried = s_retried;
     if (failed != NULL) *failed = s_failed;
+}
+
+uint32_t sdcard_bounced_sectors(void) {
+    return s_bounced;
 }
